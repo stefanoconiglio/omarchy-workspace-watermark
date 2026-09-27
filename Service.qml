@@ -42,6 +42,19 @@ Item {
   // segment right before the editor suffix.
   readonly property var editorSuffixes: [" - Visual Studio Code", " - VSCodium", " - Cursor", " - Code - OSS"]
 
+  // Terminals that run one process per window, so a window maps to one shell.
+  readonly property var terminalClasses: ["foot", "Alacritty", "kitty", "com.mitchellh.ghostty", "org.wezfurlong.wezterm", "xterm"]
+
+  // Chromium app windows are classed "<browser>-<host>_<path>-<profile>".
+  readonly property var webAppClass: /^(?:brave|chrome|chromium|google-chrome|msedge|vivaldi)-([^_]+)_(.*)-[^-]+$/
+  readonly property var webApps: webAppIndex(DesktopEntries.applications.values)
+
+  readonly property string scanScript: decodeURIComponent(Qt.resolvedUrl("terminal-cwds.sh").toString().replace(/^file:\/\//, ""))
+
+  // Terminal PID -> { shell: cwd, claude: cwd }, refreshed every few seconds.
+  property var terminalFolders: ({})
+  property string terminalFoldersJson: "{}"
+
   function num(value, fallback) {
     if (value === null || value === undefined || value === "") return fallback
     var n = Number(value)
@@ -105,24 +118,105 @@ Item {
       var suffix = editorSuffixes[i]
       if (title.length <= suffix.length || title.slice(-suffix.length) !== suffix) continue
       var parts = title.slice(0, -suffix.length).split(" - ")
-      var project = parts[parts.length - 1].replace(/\s*\[[^\]]*\]\s*$/, "").trim()
-      return project.replace(/[-_]{2,}/g, " ")
+      return tidy(parts[parts.length - 1].replace(/\s*\[[^\]]*\]\s*$/, "").trim())
     }
     return ""
   }
 
-  function detectProject(ws) {
+  function tidy(name) {
+    return String(name || "").replace(/[-_]{2,}/g, " ")
+  }
+
+  function folderName(path) {
+    path = String(path || "").replace(/\/+$/, "")
+    if (!path) return ""
+    if (path === Quickshell.env("HOME")) return "~"
+    return tidy(path.slice(path.lastIndexOf("/") + 1))
+  }
+
+  function appIdOf(window) {
+    return window && window.wayland ? String(window.wayland.appId || "") : ""
+  }
+
+  function pidOf(window) {
+    var ipc = window ? window.lastIpcObject : null
+    return ipc && ipc.pid ? String(ipc.pid) : ""
+  }
+
+  function isTerminal(appId) {
+    return terminalClasses.indexOf(appId) !== -1
+  }
+
+  // Web app launchers (omarchy-launch-webapp <url>) keyed the way Chromium
+  // names app windows: host plus the URL path with slashes turned into "_".
+  function webAppIndex(entries) {
+    var exact = {}
+    var byHost = {}
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i]
+      var args = entry && entry.command ? entry.command : []
+      for (var j = 0; j < args.length; j++) {
+        var m = String(args[j]).match(/^https?:\/\/([^\/?#]+)([^?#]*)/)
+        if (!m) continue
+        var host = m[1].toLowerCase()
+        var path = m[2] || "/"
+        exact[host + "_" + path.replace(/\//g, "_")] = entry.name
+        if (!byHost[host] || path.length < byHost[host].pathLength)
+          byHost[host] = { name: entry.name, pathLength: path.length }
+        break
+      }
+    }
+    return { exact: exact, byHost: byHost }
+  }
+
+  function webAppName(appId) {
+    var m = appId.match(webAppClass)
+    if (!m) return ""
+    var host = m[1].toLowerCase()
+    var named = webApps.exact[host + "_" + m[2]] || (webApps.byHost[host] || {}).name
+    if (named) return named
+    var parts = host.split(".")
+    var core = parts.length > 1 ? parts[parts.length - 2] : parts[0]
+    return core.charAt(0).toUpperCase() + core.slice(1)
+  }
+
+  // The best name one window offers, as [tier, name]; lower tiers win.
+  function windowLabel(window) {
+    var project = editorProject(window.title)
+    if (project) return [0, project]
+    var appId = appIdOf(window)
+    if (isTerminal(appId)) {
+      var folders = terminalFolders[pidOf(window)]
+      if (folders && folders.claude) return [1, folderName(folders.claude)]
+      if (folders && folders.shell) return [2, folderName(folders.shell)]
+      return null
+    }
+    var web = webAppName(appId)
+    if (web) return [3, web]
+    var entry = appId ? DesktopEntries.heuristicLookup(appId) : null
+    return entry && entry.name ? [4, entry.name] : null
+  }
+
+  // Take the best tier present on the workspace, then its most common name.
+  function autoLabel(ws) {
     var windows = ws.toplevels ? ws.toplevels.values : []
+    var bestTier = Infinity
     var counts = {}
     var best = ""
     var bestCount = 0
     for (var i = 0; i < windows.length; i++) {
-      var project = editorProject(windows[i].title)
-      if (!project) continue
-      counts[project] = (counts[project] || 0) + 1
-      if (counts[project] > bestCount) {
-        best = project
-        bestCount = counts[project]
+      var found = windowLabel(windows[i])
+      if (!found || found[0] > bestTier) continue
+      if (found[0] < bestTier) {
+        bestTier = found[0]
+        counts = {}
+        best = ""
+        bestCount = 0
+      }
+      counts[found[1]] = (counts[found[1]] || 0) + 1
+      if (counts[found[1]] > bestCount) {
+        best = found[1]
+        bestCount = counts[found[1]]
       }
     }
     return best
@@ -133,7 +227,61 @@ Item {
     var explicit = root.labels[String(ws.id)] || root.labels[ws.name]
     if (explicit) return String(explicit)
     if (ws.name && ws.name !== String(ws.id)) return ws.name
-    return root.autoDetectProject ? detectProject(ws) : ""
+    return root.autoDetectProject ? autoLabel(ws) : ""
+  }
+
+  function scanTerminals() {
+    if (terminalScan.running) return
+    var pids = []
+    var missingPid = false
+    var windows = Hyprland.toplevels.values
+    for (var i = 0; i < windows.length; i++) {
+      if (!isTerminal(appIdOf(windows[i]))) continue
+      var pid = pidOf(windows[i])
+      if (!pid) missingPid = true
+      else if (pids.indexOf(pid) === -1) pids.push(pid)
+    }
+    // Window PIDs arrive with a toplevel refresh; new windows get one next tick.
+    if (missingPid) Hyprland.refreshToplevels()
+    if (pids.length === 0) {
+      setTerminalFolders({})
+      return
+    }
+    terminalScan.command = ["bash", scanScript].concat(pids)
+    terminalScan.running = true
+  }
+
+  function setTerminalFolders(folders) {
+    var json = JSON.stringify(folders)
+    if (json === terminalFoldersJson) return
+    terminalFoldersJson = json
+    terminalFolders = folders
+  }
+
+  Timer {
+    interval: 3000
+    repeat: true
+    triggeredOnStart: true
+    running: root.shown && root.autoDetectProject
+    onTriggered: root.scanTerminals()
+  }
+
+  Process {
+    id: terminalScan
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var folders = {}
+        var lines = String(text || "").split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var m = lines[i].match(/^(\d+) (shell|claude) (.+)$/)
+          if (!m) continue
+          var entry = folders[m[1]] || (folders[m[1]] = { shell: "", claude: "" })
+          if (m[2] === "shell") entry.shell = m[3]
+          else if (!entry.claude) entry.claude = m[3]
+        }
+        root.setTerminalFolders(folders)
+      }
+    }
   }
 
   FileView {
@@ -164,6 +312,17 @@ Item {
 
     function state(): string {
       return root.shown ? "on" : "off"
+    }
+
+    // One "<workspace> <name>" line per workspace, for checking without switching.
+    function names(): string {
+      var workspaces = Hyprland.workspaces.values.slice()
+      workspaces.sort(function(a, b) { return a.id - b.id })
+      var lines = []
+      for (var i = 0; i < workspaces.length; i++) {
+        if (workspaces[i].id > 0) lines.push(root.numberFor(workspaces[i]) + " " + root.labelFor(workspaces[i]))
+      }
+      return lines.join("\n")
     }
   }
 
