@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.stefanoconiglio.workspace-watermark",
+  "name": "Workspace Watermark",
+  "version": "1.0.0",
+  "author": "Stefano Coniglio",
+  "license": "MIT",
+  "description": "Frames each screen in a per-workspace hue and shows a faint watermark naming the project you work on there, auto-detected from VS Code window titles.",
+  "kinds": ["service"],
+  "entryPoints": { "service": "Service.qml" }
+}
