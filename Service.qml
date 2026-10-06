@@ -5,8 +5,12 @@ import Quickshell.Wayland
 import Quickshell.Hyprland
 import qs.Commons
 
-// Per-workspace watermark: a thin frame around each screen in the active
-// workspace's hue, plus a faint project label in one corner. It sits on the
+// Per-workspace watermark: on each workspace switch, the workspace's name and
+// the list of its windows (oldest process first) show in big letters in one
+// corner, in the workspace's hue, then fade away (or, if set, to a faint
+// watermark). The screen behind can be dimmed (`backdropOpacity`, off by
+// default). An
+// optional thin frame in the same hue goes around each screen. It sits on the
 // overlay layer so it stays visible over fullscreen windows, and its input
 // region is empty so it never takes clicks.
 //
@@ -30,10 +34,16 @@ Item {
   property var lastFileVisible: undefined
 
   readonly property string position: String(config.position || "bottom-right")
+  readonly property bool frame: config.frame === true
   readonly property real frameWidth: num(config.frameWidth, 3)
   readonly property real frameOpacity: num(config.frameOpacity, 0.6)
   readonly property real labelOpacity: num(config.labelOpacity, 0.14)
   readonly property bool flashOnSwitch: config.flashOnSwitch !== false
+  readonly property real flashDuration: Math.max(0, num(config.flashDuration, 2500))
+  readonly property bool fadeAway: config.fadeAway !== false
+  readonly property bool windowList: config.windowList !== false
+  readonly property real fontSize: Math.max(12, num(config.fontSize, 60))
+  readonly property real backdropOpacity: Math.min(1, Math.max(0, num(config.backdropOpacity, 0)))
   readonly property bool autoDetectProject: config.autoDetectProject !== false
   readonly property var labels: config.labels || ({})
   readonly property var colors: config.colors || ({})
@@ -51,7 +61,11 @@ Item {
 
   readonly property string scanScript: decodeURIComponent(Qt.resolvedUrl("terminal-cwds.sh").toString().replace(/^file:\/\//, ""))
 
-  // Terminal PID -> { shell: cwd, claude: cwd }, refreshed every few seconds.
+  // Asks every screen to show its overlay again (the `flash` command).
+  signal flashRequested()
+
+  // Terminal PID -> { shell: cwd, claude: cwd, program: name }, refreshed
+  // every few seconds.
   property var terminalFolders: ({})
   property string terminalFoldersJson: "{}"
 
@@ -230,16 +244,81 @@ Item {
     return root.autoDetectProject ? autoLabel(ws) : ""
   }
 
+  // The app a window belongs to: the program a terminal runs, a web app's
+  // name, or the app's own name.
+  function appName(window) {
+    var appId = appIdOf(window)
+    if (isTerminal(appId)) {
+      var folders = terminalFolders[pidOf(window)]
+      return folders && folders.program ? folders.program : "terminal"
+    }
+    var web = webAppName(appId)
+    if (web) return web
+    var entry = appId ? DesktopEntries.heuristicLookup(appId) : null
+    return entry && entry.name ? entry.name : (appId || "window")
+  }
+
+  // What the window shows, from its title without the app's own suffix
+  // (" - Brave", " - GNU Emacs at host"); "" when it only repeats the app.
+  function windowDetail(window, app) {
+    var title = String(window.title || "")
+    var project = editorProject(title)
+    if (project) return project
+    var appId = appIdOf(window)
+    if (isTerminal(appId)) {
+      var folders = terminalFolders[pidOf(window)]
+      if (folders && folders.program === "claude" && folders.claude) return folderName(folders.claude)
+      // Shells title the window "user@host:dir"; herdr titles it "host: workspace".
+      var rest = title.replace(/^([^@\s]+@)?[^:\s]+:\s*/, "")
+      return rest || (folders ? folderName(folders.shell) : "")
+    }
+    var key = function(s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, "") }
+    var marks = [key(app.split(" ")[0]), key(appId.split(/[-._]/)[0])]
+    var parts = title.split(" - ")
+    if (parts.length > 1) {
+      var last = key(parts[parts.length - 1])
+      for (var i = 0; i < marks.length; i++) {
+        if (marks[i] && last.indexOf(marks[i]) !== -1) {
+          parts.pop()
+          break
+        }
+      }
+    }
+    var detail = parts.join(" - ").trim()
+    // A bare host or the app's own name says nothing new.
+    if (key(detail) === key(app) || (/^[\w.-]+$/.test(detail) && key(detail).indexOf(key(app)) !== -1)) return ""
+    return detail
+  }
+
+  // The workspace's windows, oldest process first; windows of one process
+  // (every Brave window, say) keep the order Hyprland lists them in.
+  function windowRows(ws) {
+    var windows = ws && ws.toplevels ? ws.toplevels.values : []
+    var items = []
+    for (var i = 0; i < windows.length; i++) {
+      var pid = Number(pidOf(windows[i]))
+      items.push({ window: windows[i], pid: pid > 0 ? pid : Infinity, index: i })
+    }
+    items.sort(function(a, b) { return a.pid !== b.pid ? (a.pid < b.pid ? -1 : 1) : a.index - b.index })
+    var rows = []
+    for (var j = 0; j < items.length; j++) {
+      var app = appName(items[j].window)
+      rows.push({ app: app, detail: windowDetail(items[j].window, app), pid: items[j].pid })
+    }
+    return rows
+  }
+
   function scanTerminals() {
     if (terminalScan.running) return
     var pids = []
     var missingPid = false
     var windows = Hyprland.toplevels.values
     for (var i = 0; i < windows.length; i++) {
-      if (!isTerminal(appIdOf(windows[i]))) continue
       var pid = pidOf(windows[i])
+      // The list sorts every window by PID, not just terminals.
       if (!pid) missingPid = true
-      else if (pids.indexOf(pid) === -1) pids.push(pid)
+      if (!pid || !isTerminal(appIdOf(windows[i]))) continue
+      if (pids.indexOf(pid) === -1) pids.push(pid)
     }
     // Window PIDs arrive with a toplevel refresh; new windows get one next tick.
     if (missingPid) Hyprland.refreshToplevels()
@@ -262,7 +341,7 @@ Item {
     interval: 3000
     repeat: true
     triggeredOnStart: true
-    running: root.shown && root.autoDetectProject
+    running: root.shown && (root.autoDetectProject || root.windowList)
     onTriggered: root.scanTerminals()
   }
 
@@ -273,10 +352,11 @@ Item {
         var folders = {}
         var lines = String(text || "").split("\n")
         for (var i = 0; i < lines.length; i++) {
-          var m = lines[i].match(/^(\d+) (shell|claude) (.+)$/)
+          var m = lines[i].match(/^(\d+) (shell|claude|program) (.+)$/)
           if (!m) continue
-          var entry = folders[m[1]] || (folders[m[1]] = { shell: "", claude: "" })
+          var entry = folders[m[1]] || (folders[m[1]] = { shell: "", claude: "", program: "" })
           if (m[2] === "shell") entry.shell = m[3]
+          else if (m[2] === "program") entry.program = m[3]
           else if (!entry.claude) entry.claude = m[3]
         }
         root.setTerminalFolders(folders)
@@ -314,6 +394,27 @@ Item {
       return root.shown ? "on" : "off"
     }
 
+    // Show the name and window list again, as after a switch.
+    function flash(): string {
+      root.flashRequested()
+      return "flashed"
+    }
+
+    // Each workspace's window list as it would show, one
+    // "<workspace> <pid> <app> — <detail>" line per window.
+    function windows(): string {
+      var workspaces = Hyprland.workspaces.values.slice()
+      workspaces.sort(function(a, b) { return a.id - b.id })
+      var lines = []
+      for (var i = 0; i < workspaces.length; i++) {
+        if (workspaces[i].id <= 0) continue
+        var rows = root.windowRows(workspaces[i])
+        for (var j = 0; j < rows.length; j++)
+          lines.push(root.numberFor(workspaces[i]) + " " + rows[j].pid + " " + rows[j].app + (rows[j].detail ? " — " + rows[j].detail : ""))
+      }
+      return lines.join("\n")
+    }
+
     // One "<workspace> <name>" line per workspace, for checking without switching.
     function names(): string {
       var workspaces = Hyprland.workspaces.values.slice()
@@ -338,11 +439,21 @@ Item {
       readonly property color hue: root.hueFor(workspace)
       readonly property string number: root.numberFor(workspace)
       readonly property string project: root.labelFor(workspace)
+      readonly property var rows: root.windowList ? root.windowRows(workspace) : []
       readonly property bool atTop: root.position.indexOf("top") === 0
       readonly property bool atLeft: root.position.indexOf("left") !== -1
 
-      // 1 right after a workspace switch, easing back to 0.
+      // 1 right after a workspace switch, held, then easing back to 0.
       property real flash: 0
+      // What stays between switches: nothing, or a faint watermark.
+      readonly property real restOpacity: root.fadeAway ? 0 : root.labelOpacity
+
+      // One big font for the name and every window: as large as fits the
+      // screen's height, up to `fontSize`.
+      readonly property real margin: 36
+      readonly property real maxWidth: Math.max(0, width - 2 * margin)
+      readonly property real textSize: Math.max(18, Math.min(root.fontSize,
+        Math.floor((height - 56 - 48) / (1 + rows.length) / 1.35)))
 
       screen: modelData
       anchors { top: true; bottom: true; left: true; right: true }
@@ -355,14 +466,22 @@ Item {
 
       onWorkspaceChanged: if (root.flashOnSwitch && workspace) flashAnimation.restart()
 
-      NumberAnimation {
+      Connections {
+        target: root
+        function onFlashRequested() { if (panel.workspace) flashAnimation.restart() }
+      }
+
+      SequentialAnimation {
         id: flashAnimation
-        target: panel
-        property: "flash"
-        from: 1
-        to: 0
-        duration: 1400
-        easing.type: Easing.InQuad
+        PropertyAction { target: panel; property: "flash"; value: 1 }
+        PauseAnimation { duration: Math.max(0, root.flashDuration - 800) }
+        NumberAnimation {
+          target: panel
+          property: "flash"
+          to: 0
+          duration: Math.min(800, root.flashDuration)
+          easing.type: Easing.InQuad
+        }
       }
 
       // Stay mapped and fade the content instead: remapping would restack the
@@ -372,8 +491,16 @@ Item {
         opacity: root.shown && panel.workspace ? 1 : 0
         Behavior on opacity { NumberAnimation { duration: 200 } }
 
+        // Dims the screen behind the text while it flashes, if set.
         Rectangle {
           anchors.fill: parent
+          color: Color.background
+          opacity: root.backdropOpacity * panel.flash
+        }
+
+        Rectangle {
+          anchors.fill: parent
+          visible: root.frame
           color: "transparent"
           border.width: root.frameWidth
           border.color: Qt.rgba(panel.hue.r, panel.hue.g, panel.hue.b, root.frameOpacity)
@@ -382,8 +509,8 @@ Item {
 
         Column {
           id: label
-          spacing: 2
-          opacity: root.labelOpacity + (0.85 - root.labelOpacity) * panel.flash
+          spacing: 0
+          opacity: panel.restOpacity + (1 - panel.restOpacity) * panel.flash
 
           // Clear the bar at the top and editor status bars at the bottom.
           anchors.top: panel.atTop ? parent.top : undefined
@@ -392,28 +519,52 @@ Item {
           anchors.right: panel.atLeft ? undefined : parent.right
           anchors.topMargin: 56
           anchors.bottomMargin: 48
-          anchors.leftMargin: 36
-          anchors.rightMargin: 36
+          anchors.leftMargin: panel.margin
+          anchors.rightMargin: panel.margin
 
           Text {
             anchors.left: panel.atLeft ? parent.left : undefined
             anchors.right: panel.atLeft ? undefined : parent.right
-            text: panel.project || panel.number
+            width: Math.min(implicitWidth, panel.maxWidth)
+            elide: Text.ElideRight
+            text: panel.project ? panel.number + " · " + panel.project : panel.number
             color: panel.hue
             font.family: Style.font.family
-            font.pixelSize: panel.project ? 46 : 110
-            font.weight: Font.Bold
+            font.pixelSize: panel.textSize
+            font.weight: Font.Black
           }
 
-          Text {
-            anchors.left: panel.atLeft ? parent.left : undefined
-            anchors.right: panel.atLeft ? undefined : parent.right
-            visible: panel.project !== ""
-            text: "workspace " + panel.number
-            color: panel.hue
-            font.family: Style.font.family
-            font.pixelSize: 18
-            font.weight: Font.DemiBold
+          Repeater {
+            model: panel.rows
+
+            Row {
+              required property var modelData
+              anchors.left: panel.atLeft ? parent.left : undefined
+              anchors.right: panel.atLeft ? undefined : parent.right
+              spacing: panel.textSize * 0.4
+
+              Text {
+                id: appText
+                width: Math.min(implicitWidth, panel.maxWidth)
+                elide: Text.ElideRight
+                text: modelData.app
+                color: panel.hue
+                font.family: Style.font.family
+                font.pixelSize: panel.textSize
+                font.weight: Font.Bold
+              }
+
+              Text {
+                visible: text !== "" && width > panel.textSize
+                width: Math.max(0, Math.min(implicitWidth, panel.maxWidth - appText.width - parent.spacing))
+                elide: Text.ElideRight
+                text: modelData.detail
+                color: panel.hue
+                opacity: 0.75
+                font.family: Style.font.family
+                font.pixelSize: panel.textSize
+              }
+            }
           }
         }
       }

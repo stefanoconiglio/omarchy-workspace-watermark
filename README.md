@@ -1,10 +1,21 @@
 # Workspace Watermark
 
-An Omarchy shell plugin for people who keep one project per workspace. Each
-workspace gets its own hue, drawn as a thin frame around the screen, and a
-faint watermark in a corner names the project you work on there. When you
-switch workspaces the name flashes at full strength for about a second, then
-settles back to a watermark.
+An Omarchy shell plugin that tells you where you are when you switch
+workspaces. Each workspace gets its own hue. On every switch, big letters in
+that hue show the workspace's number, the name of what you work on there, and
+every window open on it, oldest first, all in one big font that grows to fill
+the screen. After a couple of seconds it fades away completely.
+
+```
+                           3 · my-thesis
+                        herdr  my-thesis
+              Brave  Hyprland - ArchWiki
+                                 Spotify
+```
+
+If you'd rather keep it, it can instead settle into a faint watermark, and a
+thin frame in the workspace's hue can go around the screen (both off by
+default; see Settings).
 
 Names are picked up automatically from what's open on the workspace: the
 VS Code project, else the folder a Claude Code session runs in, else a
@@ -36,8 +47,8 @@ o.bind("SUPER + ALT + W", "Toggle workspace watermark", "omarchy-shell workspace
 
 ## Screen sharing
 
-The frame and watermark show up in screenshots, screen recordings and screen
-shares. Hyprland's `no_screen_share` layer rule doesn't help here: on Hyprland
+The frame, the name and the window list show up in screenshots, screen
+recordings and screen shares, and the list shows window titles. Hyprland's `no_screen_share` layer rule doesn't help here: on Hyprland
 0.56 it replaces the whole full-screen layer with black, so the entire capture
 comes out blank. Hide the watermark with the toggle before you share your
 screen.
@@ -61,12 +72,37 @@ under `plugins`, and apply as soon as you save. Every key is optional:
 | `labels`            | `{}`             | Name per workspace id. A name here always wins over auto-detection. |
 | `colors`            | `{}`             | Hex color per workspace id. Others get a distinct hue automatically. |
 | `position`          | `"bottom-right"` | Watermark corner: `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
-| `frameWidth`        | `3`              | Frame thickness in pixels. `0` turns the frame off. |
+| `windowList`        | `true`           | List the workspace's windows under its name. |
+| `fontSize`          | `60`             | Largest letter size in pixels. With many windows the letters shrink so that every line fits the screen. |
+| `backdropOpacity`   | `0`              | Dim the screen behind the letters while they show, from `0` (not at all) to `1`. |
+| `fadeAway`          | `true`           | After a switch, fade away completely. `false` settles into a faint watermark instead. |
+| `labelOpacity`      | `0.14`           | Watermark strength between switches when `fadeAway` is `false`, from `0` to `1`. |
+| `flashOnSwitch`     | `true`           | Show the name and list at full strength after switching. With `fadeAway` on, `false` means nothing shows until `flash`. |
+| `flashDuration`     | `2500`           | Milliseconds from the switch until faded; the last 800 are the fade. |
+| `frame`             | `false`          | Draw a frame in the workspace's hue around the screen. |
+| `frameWidth`        | `3`              | Frame thickness in pixels, when `frame` is on. |
 | `frameOpacity`      | `0.6`            | Frame strength, from `0` to `1`. |
-| `labelOpacity`      | `0.14`           | Watermark strength between switches, from `0` to `1`. |
-| `flashOnSwitch`     | `true`           | Show the name at full strength for a moment after switching. |
 | `autoDetectProject` | `true`           | Name workspaces from their windows, as described below. `false` shows only `labels` and numbers. |
 | `visible`           | `true`           | Whether the overlay is shown. The toggle updates this for you. |
+
+### The window list
+
+One line per window on the workspace, in the same big font as the name: the
+app, then what the window shows, cut short with "…" where the screen ends.
+
+- A terminal shows the program its shell runs (`herdr`, `nvim`, `btop`,
+  `claude`), or `terminal` at a bare prompt. Next to it is the window's
+  title without the `user@host:` prefix, or for Claude Code its folder.
+- A web app shows its name and page title, such as `YouTube  Ten Percent`.
+- Any other app shows its name and title, without the app's own suffix
+  (`Brave  John Searle obituary…`, not `… - Brave`). VS Code shows its project.
+
+Windows are ordered by process ID, oldest first, which tells you roughly
+when each was opened. Windows of one process share an ID (every Brave and
+web-app window is one Brave process), so they appear together, in the order
+Hyprland lists them.
+
+### The name
 
 A workspace's name comes from the first of these that applies:
 
@@ -107,7 +143,9 @@ omarchy-shell workspace-watermark toggle
 omarchy-shell workspace-watermark show
 omarchy-shell workspace-watermark hide
 omarchy-shell workspace-watermark state
-omarchy-shell workspace-watermark names   # the name each workspace would show
+omarchy-shell workspace-watermark flash     # show the name and list again now
+omarchy-shell workspace-watermark names     # the name each workspace would show
+omarchy-shell workspace-watermark windows   # each workspace's window list
 ```
 
 ## Remove
@@ -129,7 +167,8 @@ Quickshell's Hyprland integration and reads its settings from `shell.json`.
 Every three seconds, while the watermark is shown and a terminal window is
 open, it runs `terminal-cwds.sh` with the terminal windows' process IDs. The
 script reads the process table with `ps` and each shell's and Claude Code
-session's working directory from `/proc`, and prints them. It changes
+session's working directory from `/proc`, and prints them with the name of
+the program each terminal's shell runs (its newest child process). It changes
 nothing. The plugin makes no network requests and has no dependencies beyond
 Omarchy itself.
 
