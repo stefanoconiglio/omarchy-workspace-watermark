@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.stefanoconiglio.workspace-watermark",
+  "name": "Workspace Watermark",
+  "version": "1.2.0",
+  "author": "Stefano Coniglio",
+  "license": "MIT",
+  "description": "On each workspace switch, shows in big letters what you work on there (the VS Code project, a Claude Code or terminal folder, or the web app that's open) and every window on the workspace, oldest first, in the workspace's hue, then fades away. Optional frame and faint watermark.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
